@@ -236,18 +236,23 @@ function award(S, loser, four) {
   const mx = Math.max(...S.sc);
   if (mx >= TARGET && S.sc.filter(v => v === mx).length === 1) S.win = S.sc.indexOf(mx);
 }
-function moveBlob(S, i, bits) {
-  const q = S.p[i];
+function moveBlob(S, i, bits) { moveQ(S.p[i], S.z[i], bits); }
+function moveQ(q, zone, bits) {
   q.vx = ((bits & 2 ? 1 : 0) - (bits & 1 ? 1 : 0)) * SPEED;
   q.x += q.vx * STEP;
-  const [l, r] = bounds(S.z[i]); q.x = clamp(q.x, l, r);
+  const [l, r] = bounds(zone); q.x = clamp(q.x, l, r);
   const J = bits & 4;
   if (q.y >= G - 0.5 && J) q.vy = -JUMP;
   q.vy += (J && q.vy < 0 ? GRAV_UP : GRAV) * STEP;
   q.y += q.vy * STEP;
   if (q.y >= G) { q.y = G; q.vy = 0; }
 }
-function step(S, inp) {
+// A remote player simulates its own blob and reports where it is; the host trusts that, within the zone.
+function applyExt(S, i, e) {
+  const q = S.p[i], [l, r] = bounds(S.z[i]);
+  q.x = clamp(e[0], l, r); q.y = clamp(e[1], G - 420, G); q.vx = clamp(e[2], -SPEED, SPEED); q.vy = clamp(e[3], -JUMP - 50, 3000);
+}
+function step(S, inp, ext) {
   const dt = STEP;
   S.t++; S.pt += dt * 1000;
   const b = S.b;
@@ -267,7 +272,7 @@ function step(S, inp) {
     if (k >= 1) setupServe(S);
     return;
   }
-  for (let i = 0; i < 3; i++) moveBlob(S, i, inp[i]);
+  for (let i = 0; i < 3; i++) { if (ext && ext[i]) applyExt(S, i, ext[i]); else moveBlob(S, i, inp[i]); }
   if (b.hang) { S.hangT += dt * 1000; if (S.hangT > 2600) b.hang = 0; }
   if (!b.hang) { b.vy += BGRAV * dt; b.x += b.vx * dt; b.y += b.vy * dt; }
   if (b.x < BR) { b.x = BR; b.vx = Math.abs(b.vx) * .92; }
@@ -568,7 +573,7 @@ function banner(text, sub, col) {
 // ---------- render with smoothing for remote state ----------
 const disp = { b: { x: 600, y: G - 330 }, p: [0, 1, 2].map(i => ({ x: zc(i), y: G })) };
 const squashT = [0, 0, 0];
-function render(V, names, mySeat, age, smooth, dt, now) {
+function render(V, names, mySeat, age, smooth, dt, now, ownPred) {
   ctx.setTransform(scale, 0, 0, scale, 0, 0);
   const live = V.ph === "play" || V.ph === "point";
   // targets
@@ -579,6 +584,7 @@ function render(V, names, mySeat, age, smooth, dt, now) {
   snap(disp.b, bx, by);
   for (let i = 0; i < 3; i++) {
     const q = V.p[i]; let x = q.x, y = q.y;
+    if (ownPred && i === mySeat) { disp.p[i].x = ownPred.x; disp.p[i].y = ownPred.y; continue; }
     if (live && age > 0) { x += q.vx * age; y = Math.min(G, y + q.vy * age); const [l, r] = bounds(V.z[i]); x = clamp(x, l, r); }
     snap(disp.p[i], x, y);
   }
@@ -628,7 +634,7 @@ const seatBtns = [0, 1, 2].map(i => {
   b.type = "button"; b.className = "seat"; b.style.setProperty("--c", COLORS[i]);
   b.innerHTML = '<span class="dot"></span><span class="k"></span><span class="who"></span><span class="tag" hidden>du</span>';
   b.querySelector(".k").textContent = "Platz " + SEATN[i] + " · " + COLN[i];
-  b.onclick = () => { ensureAudio(); setP({ s: me.s === i ? -1 : i }); };
+  b.onclick = () => { ensureAudio(); autoSeat = false; setP({ s: me.s === i ? -1 : i }); };
   seatsEl.appendChild(b);
   return b;
 });
@@ -674,7 +680,11 @@ function peerJoin(name, create) {
       try { peer.destroy(); } catch (e) {}
     };
     const okPr = pr => !!pr && typeof pr === "object" && !Array.isArray(pr) && JSON.stringify(pr).length < 6000;
-    const send = (c, m) => { try { if (c && c.open) c.send(m); } catch (e) {} };
+    const send = (c, m) => {
+      try { if (!c || !c.open) return; const dc = c.dataChannel; if (dc && dc.bufferedAmount > 65536 && m.t === "p") return; c.send(m); } catch (e) {}
+    };
+    const lastQ = new Map(); let q = 0;
+    const fresh = (id, mq) => { mq = +mq; if (!Number.isFinite(mq)) return true; const o = lastQ.get(id); if (o !== undefined && mq <= o && o - mq < 1e6) return false; lastQ.set(id, mq); return true; };
     const bcast = (m, except) => { for (const [id, c] of conns) if (id !== except) send(c, m); };
     const api = {
       name,
@@ -683,7 +693,8 @@ function peerJoin(name, create) {
       presence(patch) {
         for (const k in patch) { if (patch[k] === null) delete mine[k]; else mine[k] = patch[k]; }
         mine = { ...mine }; rebuild();
-        if (create) bcast({ t: "p", id: myId, pr: mine }); else send(hubConn, { t: "p", pr: mine });
+        q++;
+        if (create) bcast({ t: "p", id: myId, pr: mine, q }); else send(hubConn, { t: "p", pr: mine, q });
         return Promise.resolve();
       },
       onConnection(f, onErr) { connCbs.push(f); if (onErr) errCbs.push(onErr); setTimeout(() => f(open && !dead)); return () => {}; },
@@ -693,7 +704,8 @@ function peerJoin(name, create) {
     peer.on("open", id => {
       myId = id; rebuild();
       if (create) { settled = true; setOpen(true); resolve(api); return; }
-      hubConn = peer.connect(hubId, { serialization: "json", reliable: true });
+      hubConn = peer.connect(hubId, { serialization: "json", reliable: false });
+      const keep = setInterval(() => { if (dead) { clearInterval(keep); return; } q++; send(hubConn, { t: "p", pr: mine, q }); }, 1000);
       hubConn.on("open", () => { send(hubConn, { t: "p", pr: mine }); if (!settled) { settled = true; resolve(api); } setOpen(true); });
       hubConn.on("data", m => {
         if (!m || typeof m !== "object") return;
@@ -701,7 +713,7 @@ function peerJoin(name, create) {
           others.clear();
           for (const e of m.list) if (Array.isArray(e) && typeof e[0] === "string" && e[0] !== myId && okPr(e[1])) others.set(e[0], e[1]);
           rebuild();
-        } else if (m.t === "p" && typeof m.id === "string" && m.id !== myId && okPr(m.pr)) { others.set(m.id, m.pr); rebuild(); }
+        } else if (m.t === "p" && typeof m.id === "string" && m.id !== myId && okPr(m.pr) && fresh(m.id, m.q)) { others.set(m.id, m.pr); rebuild(); }
         else if (m.t === "x" && typeof m.id === "string") { others.delete(m.id); rebuild(); }
       });
       hubConn.on("close", () => fail("upstream_error", "Session beendet"));
@@ -714,7 +726,7 @@ function peerJoin(name, create) {
         send(c, { t: "all", list: [[myId, mine], ...others] });
       });
       c.on("data", m => {
-        if (m && typeof m === "object" && m.t === "p" && okPr(m.pr) && conns.get(c.peer) === c) { others.set(c.peer, m.pr); rebuild(); bcast({ t: "p", id: c.peer, pr: m.pr }, c.peer); }
+        if (m && typeof m === "object" && m.t === "p" && okPr(m.pr) && conns.get(c.peer) === c && fresh(c.peer, m.q)) { others.set(c.peer, m.pr); rebuild(); bcast({ t: "p", id: c.peer, pr: m.pr, q: m.q }, c.peer); }
       });
       const gone = () => { if (conns.get(c.peer) === c) { conns.delete(c.peer); others.delete(c.peer); rebuild(); bcast({ t: "x", id: c.peer }); } };
       c.on("close", gone); c.on("error", gone);
@@ -727,11 +739,13 @@ function peerJoin(name, create) {
     });
     peer.on("disconnected", () => { try { if (!dead) peer.reconnect(); } catch (e) {} });
     setTimeout(() => { if (!settled) fail("upstream_error", "Zeitüberschreitung"); }, 15000);
+    if (create) { const sync = setInterval(() => { if (dead) { clearInterval(sync); return; } bcast({ t: "all", list: [[myId, mine], ...others] }); }, 1000); }
     rebuild();
   });
 }
 
 // ---------- sessions with game codes ----------
+let autoSeat = false;
 let lobby = null, lobbyState = "pending", mode = "menu", code = "", menuMsg = "", joining = false;
 const ALPH = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const mkCode = () => Array.from({ length: 4 }, () => ALPH[Math.random() * ALPH.length | 0]).join("");
@@ -762,7 +776,7 @@ async function enterOnline(c, create, tries = 0) {
       if (room !== r || me.s >= 0) return;
       const seats = resolveSeats(getPeers());
       const free = seats.findIndex(s => !s);
-      if (free >= 0) setP({ s: free });
+      if (free >= 0) { autoSeat = true; setP({ s: free }); }
     }, create ? 100 : 1500);
   } catch (e) {
     const code_ = e && e.code;
@@ -852,6 +866,7 @@ function updateUi(V, seats, names, peers, host) {
 
 // ---------- main loop ----------
 let sim = null, acc = 0, lastT = performance.now();
+let lastSend = 0, pred = null, predZone = -1, predAcc = 0, predPh = "";
 let lastG = null, lastGt = -1, gotAt = 0, lastHc = -1, lastScore = "", lastPhV = "";
 const seenGo = {};
 const idleV = norm(ser(newSim(), [1, 1, 1]));
@@ -860,14 +875,19 @@ function frame(now) {
   let peers, seats, host;
   try {
     peers = getPeers(); seats = resolveSeats(peers);
-    if (me.s >= 0 && seats[me.s] && !seats[me.s].me) setP({ s: -1 });
+    if (me.s >= 0 && seats[me.s] && !seats[me.s].me) {
+      // lost a seat clash: an automatic pick moves on to another free seat
+      const free = autoSeat ? seats.findIndex(x => !x) : -1;
+      setP({ s: free });
+    }
     host = chooseHost(seats);
     if (!host && !room) host = peers.find(p => p.me);
   } catch (e) { peers = [{ peer: "~me", me: true, pr: me }]; seats = [null, null, null]; host = null; }
   const amHost = !!host && host.me;
   const bt = seats.map(s => s ? 0 : 1);
-  let V, age = 0, smooth = false;
+  let V, age = 0, smooth = false, ownPred = null;
   if (amHost) {
+    pred = null; if (me.pos) setP({ pos: null, pz: null });
     if (!sim) { sim = (lastG && norm(lastG)) || newSim(); acc = 0; }
     if (!me.hs) setP({ hs: true });
     for (const s of seats) if (s && !s.me) {
@@ -876,11 +896,20 @@ function frame(now) {
       else if (go !== seenGo[s.peer]) { seenGo[s.peer] = go; if (sim.ph === "lobby" || sim.ph === "over") startGame(sim); }
     }
     const inp = [0, 1, 2].map(i => { const sp = seats[i]; if (!sp) return botInput(sim, i); if (sp.me) return keyBits(); return (NUM(sp.pr.i) | 0) & 7; });
+    const live = sim.ph === "play" || sim.ph === "point";
+    const ext = [0, 1, 2].map(i => {
+      const sp = seats[i]; if (!live || !sp || sp.me) return null;
+      const pos = sp.pr.pos;
+      if (!Array.isArray(pos) || pos.length < 4 || (NUM(sp.pr.pz, -1) | 0) !== sim.z[i]) return null;
+      const e = pos.slice(0, 4).map(v => NUM(v, NaN));
+      return e.every(Number.isFinite) ? e : null;
+    });
     acc += dt; let n = 0;
-    while (acc >= STEP && n < 24) { step(sim, inp); acc -= STEP; n++; }
+    while (acc >= STEP && n < 24) { step(sim, inp, ext); acc -= STEP; n++; }
     if (n >= 24) acc = 0;
     const g = ser(sim, bt);
-    me.g = g; if (room) room.presence({ g }).catch(() => {});
+    me.g = g;
+    if (room && now - lastSend >= 32) { lastSend = now; room.presence({ g }).catch(() => {}); }
     lastG = g;
     V = norm(g);
   } else {
@@ -889,8 +918,20 @@ function frame(now) {
     const g = host ? host.pr.g : null;
     if (g && g !== lastG) { lastG = g; if (g.t !== lastGt) { lastGt = g.t; gotAt = now; } }
     V = host && g ? norm(g) : null;
-    if (V) { age = Math.min(.1, (now - gotAt) / 1000); smooth = true; V.bt = bt; }
+    if (V) { age = Math.min(.15, (now - gotAt) / 1000); smooth = true; V.bt = bt; }
     const kb = keyBits(); if (kb !== me.i) setP({ i: kb });
+    // predict my own blob locally so it reacts instantly
+    const ms = me.s >= 0 && seats[me.s] && seats[me.s].me ? me.s : -1;
+    if (V && ms >= 0 && (V.ph === "play" || V.ph === "point")) {
+      const zone = V.z[ms];
+      if (!pred || predZone !== zone || predPh === "rot" || predPh === "lobby" || predPh === "over") { const q = V.p[ms]; pred = { x: q.x, y: q.y, vx: 0, vy: q.vy }; predZone = zone; predAcc = 0; }
+      predAcc += dt; let n = 0;
+      while (predAcc >= STEP && n < 24) { moveQ(pred, zone, kb); predAcc -= STEP; n++; }
+      if (n >= 24) predAcc = 0;
+      if (now - lastSend >= 32) { lastSend = now; setP({ pos: [R(pred.x), R(pred.y), R(pred.vx), R(pred.vy)], pz: zone }); }
+      ownPred = pred;
+    } else { pred = null; if (me.pos) setP({ pos: null, pz: null }); }
+    predPh = V ? V.ph : "";
   }
   if (!V) { V = idleV; }
   const names = [0, 1, 2].map(i => seats[i] ? (cleanName(seats[i].pr.n) || "Spieler " + SEATN[i]) : COLN[i]);
@@ -899,7 +940,7 @@ function frame(now) {
   const scs = V.sc.join(",");
   if (scs !== lastScore) { if (lastScore && V.ph === "point") { blip(660, .12, "square", .07); blip(880, .18, "square", .07, .12); } lastScore = scs; }
   if (V.ph !== lastPhV) { if (V.ph === "over") { [523, 659, 784, 1046].forEach((f, k) => blip(f, .2, "triangle", .14, k * .13)); } lastPhV = V.ph; }
-  render(V, names, me.s >= 0 && seats[me.s] && seats[me.s].me ? me.s : -1, age, smooth, dt, now);
+  render(V, names, me.s >= 0 && seats[me.s] && seats[me.s].me ? me.s : -1, age, smooth, dt, now, ownPred);
   updateUi(V === idleV ? null : V, seats, names, peers, host);
   requestAnimationFrame(frame);
 }
