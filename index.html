@@ -62,6 +62,7 @@ button:focus-visible,input:focus-visible,summary:focus-visible{outline:3px solid
 .codebox strong{font:400 34px var(--display);letter-spacing:.2em;color:var(--mustard);line-height:1.1}
 .codebox .ghost{padding:8px 12px;font-size:14px}
 .warn{color:var(--coral)}
+.weblink{color:var(--mustard);font-weight:800;font-size:14px}
 details{font-size:14px;line-height:1.5;color:var(--muted);border-top:1px solid var(--line);padding-top:10px}
 summary{cursor:pointer;font-weight:800;color:var(--ink)}
 details ul{margin:8px 0 0;padding-left:18px;display:flex;flex-direction:column;gap:4px}
@@ -115,6 +116,7 @@ kbd{font:700 12px var(--body);background:var(--night);border:1px solid var(--lin
         </div>
         <button class="ghost" id="soloBtn" type="button">Allein gegen zwei Bots üben</button>
         <p class="status" id="menuMsg"></p>
+        <a class="weblink" id="webLink" href="https://robinnau.github.io/3-player-game/" target="_blank" rel="noopener" hidden>Zur Web-Version für Spieler mit anderen Accounts</a>
       </div>
       <div class="panel" id="lobbyPanel" hidden>
         <div class="codebox">
@@ -201,7 +203,8 @@ function chooseHost(seats) {
   const c = seats.filter(Boolean);
   if (!c.length) return null;
   const hs = c.filter(p => p.pr.hs === true);
-  const pool = hs.length ? hs : c;
+  const hub = c.filter(p => p.pr.hub === true);
+  const pool = hs.length ? hs : hub.length ? hub : c;
   return pool.reduce((a, b) => b.peer < a.peer ? b : a);
 }
 
@@ -642,28 +645,114 @@ startBtn.onclick = () => {
 };
 const seatBtnEl = $("#seatBtn");
 let uiSig = "";
+// ---------- peer-to-peer transport for the web version ----------
+// Same shape as a claude.ai named room: peers(), presence(), connected(), onConnection(), leave().
+// The session creator is the hub: everyone connects to it and it relays presence to the rest.
+const PEERJS_URL = "https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js";
+const inArtifact = !!(window.claude && window.claude.use);
+let netKind = inArtifact ? "room" : "none";
+function loadScript(src) {
+  return new Promise((res, rej) => { const s = document.createElement("script"); s.src = src; s.onload = res; s.onerror = rej; document.head.appendChild(s); });
+}
+function peerLobby() { return { join: (name, create) => peerJoin(name, !!create) }; }
+function peerJoin(name, create) {
+  const hubId = "dreierblob-v1-" + name;
+  const opts = Object.assign({ debug: 0 }, window.__PEER_OPTS || {});
+  return new Promise((resolve, reject) => {
+    const others = new Map(), conns = new Map(), connCbs = [], errCbs = [];
+    let mine = {}, snap = [], myId = null, hubConn = null, open = false, dead = false, settled = false;
+    const peer = create ? new window.Peer(hubId, opts) : new window.Peer(opts);
+    const rebuild = () => {
+      snap = Object.freeze([{ peer: myId || "~me", sameTab: true, isMe: true, kind: "viewer", guest: false, by: null, presence: mine },
+        ...[...others].map(([id, pr]) => ({ peer: id, sameTab: false, isMe: false, kind: "viewer", guest: false, by: null, presence: pr }))]);
+    };
+    const setOpen = v => { if (open === v) return; open = v; connCbs.forEach(f => { try { f(v); } catch (e) {} }); };
+    const fail = (code, message) => {
+      if (!settled) { settled = true; dead = true; try { peer.destroy(); } catch (e) {} reject({ code, message }); return; }
+      if (dead) return;
+      dead = true; setOpen(false); errCbs.forEach(f => { try { f({ code, message }); } catch (e) {} });
+      try { peer.destroy(); } catch (e) {}
+    };
+    const okPr = pr => !!pr && typeof pr === "object" && !Array.isArray(pr) && JSON.stringify(pr).length < 6000;
+    const send = (c, m) => { try { if (c && c.open) c.send(m); } catch (e) {} };
+    const bcast = (m, except) => { for (const [id, c] of conns) if (id !== except) send(c, m); };
+    const api = {
+      name,
+      peers: () => snap,
+      connected: () => open && !dead,
+      presence(patch) {
+        for (const k in patch) { if (patch[k] === null) delete mine[k]; else mine[k] = patch[k]; }
+        mine = { ...mine }; rebuild();
+        if (create) bcast({ t: "p", id: myId, pr: mine }); else send(hubConn, { t: "p", pr: mine });
+        return Promise.resolve();
+      },
+      onConnection(f, onErr) { connCbs.push(f); if (onErr) errCbs.push(onErr); setTimeout(() => f(open && !dead)); return () => {}; },
+      onPeers() { return () => {}; },
+      leave() { dead = true; try { peer.destroy(); } catch (e) {} return Promise.resolve(); }
+    };
+    peer.on("open", id => {
+      myId = id; rebuild();
+      if (create) { settled = true; setOpen(true); resolve(api); return; }
+      hubConn = peer.connect(hubId, { serialization: "json", reliable: true });
+      hubConn.on("open", () => { send(hubConn, { t: "p", pr: mine }); if (!settled) { settled = true; resolve(api); } setOpen(true); });
+      hubConn.on("data", m => {
+        if (!m || typeof m !== "object") return;
+        if (m.t === "all" && Array.isArray(m.list)) {
+          others.clear();
+          for (const e of m.list) if (Array.isArray(e) && typeof e[0] === "string" && e[0] !== myId && okPr(e[1])) others.set(e[0], e[1]);
+          rebuild();
+        } else if (m.t === "p" && typeof m.id === "string" && m.id !== myId && okPr(m.pr)) { others.set(m.id, m.pr); rebuild(); }
+        else if (m.t === "x" && typeof m.id === "string") { others.delete(m.id); rebuild(); }
+      });
+      hubConn.on("close", () => fail("upstream_error", "Session beendet"));
+      hubConn.on("error", () => fail("upstream_error", "Verbindungsfehler"));
+    });
+    if (create) peer.on("connection", c => {
+      c.on("open", () => {
+        if (conns.size >= 12) { c.close(); return; }
+        conns.set(c.peer, c);
+        send(c, { t: "all", list: [[myId, mine], ...others] });
+      });
+      c.on("data", m => {
+        if (m && typeof m === "object" && m.t === "p" && okPr(m.pr) && conns.get(c.peer) === c) { others.set(c.peer, m.pr); rebuild(); bcast({ t: "p", id: c.peer, pr: m.pr }, c.peer); }
+      });
+      const gone = () => { if (conns.get(c.peer) === c) { conns.delete(c.peer); others.delete(c.peer); rebuild(); bcast({ t: "x", id: c.peer }); } };
+      c.on("close", gone); c.on("error", gone);
+    });
+    peer.on("error", e => {
+      const t = e && e.type;
+      if (t === "unavailable-id") fail("code_taken", "Code vergeben");
+      else if (t === "peer-unavailable") fail("not_found", "Session nicht gefunden");
+      else if (!settled) fail("upstream_error", String(t || "Fehler"));
+    });
+    peer.on("disconnected", () => { try { if (!dead) peer.reconnect(); } catch (e) {} });
+    setTimeout(() => { if (!settled) fail("upstream_error", "Zeitüberschreitung"); }, 15000);
+    rebuild();
+  });
+}
+
 // ---------- sessions with game codes ----------
 let lobby = null, lobbyState = "pending", mode = "menu", code = "", menuMsg = "", joining = false;
 const ALPH = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const mkCode = () => Array.from({ length: 4 }, () => ALPH[Math.random() * ALPH.length | 0]).join("");
 const normCode = s => String(s || "").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 4);
 const menuEl = $("#menu"), lobbyPanel = $("#lobbyPanel"), codeIn = $("#codeIn"), menuMsgEl = $("#menuMsg");
-const codeOut = $("#codeOut"), codeLabel = $("#codeLabel"), copyBtn = $("#copyBtn"), newBtn = $("#newBtn"), joinBtn = $("#joinBtn");
+const webLink = $("#webLink"), codeOut = $("#codeOut"), codeLabel = $("#codeLabel"), copyBtn = $("#copyBtn"), newBtn = $("#newBtn"), joinBtn = $("#joinBtn");
 function resetGame() {
   sim = null; lastG = null; lastGt = -1;
   for (const k in seenGo) delete seenGo[k];
   me.s = -1; me.hs = false; me.g = null; me.i = 0;
 }
-async function enterOnline(c, create) {
+async function enterOnline(c, create, tries = 0) {
   if (joining) return;
   if (!lobby) { menuMsg = lobbyState === "pending" ? "Moment, Verbindung wird aufgebaut…" : "NOOP"; uiSig = ""; return; }
   joining = true; menuMsg = "Verbinde mit Session " + c + "…"; uiSig = "";
   try {
     const old = room; room = null;
     if (old) { try { await old.leave(); } catch (e) {} }
-    const r = await lobby.join("dreierblob-" + c.toLowerCase());
+    const r = await lobby.join("dreierblob-" + c.toLowerCase(), create);
     resetGame(); code = c; mode = "online"; room = r; cardOpen = true; menuMsg = "";
-    room.presence({ n: me.n, s: -1, i: 0, go: 0, hs: false }).catch(() => {});
+    room.presence({ n: me.n, s: -1, i: 0, go: 0, hs: false, hub: !!create }).catch(() => {});
     room.onConnection(() => { uiSig = ""; }, () => {
       if (room === r) { room = null; mode = "menu"; resetGame(); menuMsg = "Verbindung zur Session " + c + " verloren. Tritt mit dem Code erneut bei."; }
       uiSig = "";
@@ -676,7 +765,11 @@ async function enterOnline(c, create) {
       if (free >= 0) setP({ s: free });
     }, create ? 100 : 1500);
   } catch (e) {
-    menuMsg = (e && e.code === "limit_reached") ? "Gerade sind zu viele Sessions offen. Versuch es gleich nochmal." : "Beitreten hat nicht geklappt. Prüf den Code und versuch es nochmal.";
+    const code_ = e && e.code;
+    if (code_ === "code_taken" && create && tries < 3) { joining = false; return enterOnline(mkCode(), true, tries + 1); }
+    menuMsg = code_ === "limit_reached" ? "Gerade sind zu viele Sessions offen. Versuch es gleich nochmal."
+      : code_ === "not_found" ? "Keine Session mit dem Code " + c + " gefunden. Läuft sie noch beim Gastgeber?"
+      : "Beitreten hat nicht geklappt. Prüf den Code und deine Internetverbindung und versuch es nochmal.";
   }
   joining = false; uiSig = "";
 }
@@ -699,7 +792,7 @@ $("#leaveBtn").onclick = () => { leaveSession(); };
 copyBtn.onclick = () => {
   const done = () => { copyBtn.textContent = "Kopiert"; setTimeout(() => { copyBtn.textContent = "Kopieren"; }, 1500); };
   try {
-    navigator.clipboard.writeText(code).then(done, () => { const s = getSelection(); s.selectAllChildren(codeOut); });
+    navigator.clipboard.writeText(netKind === "p2p" ? location.origin + location.pathname + "#" + code : code).then(done, () => { const s = getSelection(); s.selectAllChildren(codeOut); });
   } catch (e) { const s = getSelection(); s.selectAllChildren(codeOut); }
 };
 
@@ -723,7 +816,8 @@ function updateUi(V, seats, names, peers, host) {
   const noNet = lobbyState === "none";
   newBtn.disabled = noNet || joining; joinBtn.disabled = noNet || joining;
   menuMsgEl.classList.toggle("warn", noNet);
-  menuMsgEl.textContent = noNet ? "Online-Sessions sind auf diesem Gerät nicht verfügbar. Bei claude.ai einloggen und die Seite über die Einladung öffnen, nicht über einen öffentlichen Link. Solo geht trotzdem."
+  webLink.hidden = !(noNet && inArtifact);
+  menuMsgEl.textContent = noNet && !inArtifact ? "Der Verbindungsdienst ist gerade nicht erreichbar. Prüf deine Internetverbindung und lade neu. Solo geht trotzdem." : noNet ? "Online-Sessions sind auf diesem Gerät nicht verfügbar. Bei claude.ai einloggen und die Seite über die Einladung öffnen, nicht über einen öffentlichen Link. Solo geht trotzdem."
     : (menuMsg && menuMsg !== "NOOP") ? menuMsg : lobbyState === "pending" ? "Verbindung wird aufgebaut…" : "Starte eine Session und gib den Code an die anderen weiter.";
   codeLabel.textContent = mode === "online" ? "Game-Code" : "Solo-Spiel";
   codeOut.textContent = mode === "online" ? code : "Bots";
@@ -811,12 +905,19 @@ function frame(now) {
 }
 requestAnimationFrame(frame);
 
-// ---------- connect to the room ----------
+// ---------- connect: claude.ai room inside the artifact, WebRTC (PeerJS) on the web version ----------
 (async () => {
-  try { lobby = window.claude && window.claude.use ? await window.claude.use("room") : null; } catch (e) { lobby = null; }
+  try { lobby = inArtifact ? await window.claude.use("room") : null; } catch (e) { lobby = null; }
+  if (!lobby && !inArtifact) {
+    try { if (!window.Peer) await loadScript(PEERJS_URL); if (window.Peer) { lobby = peerLobby(); netKind = "p2p"; } } catch (e) { lobby = null; }
+  }
   lobbyState = lobby ? "ok" : "none"; uiSig = "";
-  const h = normCode(location.hash.slice(1));
-  if (h.length === 4) { codeIn.value = h; if (lobby && mode === "menu") enterOnline(h, false); }
+  const fromHash = () => {
+    const h = normCode(location.hash.slice(1));
+    if (h.length === 4 && h !== code) { codeIn.value = h; if (lobby && mode === "menu") enterOnline(h, false); }
+  };
+  fromHash();
+  addEventListener("hashchange", fromHash);
 })();
 })();
 </script>
