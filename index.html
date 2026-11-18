@@ -628,7 +628,7 @@ function updateUi(V, seats, names, peers, host) {
   if (sig === uiSig) return;
   uiSig = sig;
   chip.classList.toggle("on", !!online);
-  chipText.textContent = !room ? "Offline · Solo gegen Bots" : online ? (n === 1 ? "Nur du bist hier" : n + " Geräte verbunden") : "verbinde…";
+  chipText.textContent = !room ? "Nicht verbunden · Solo gegen Bots" : online ? (n === 1 ? "Nur du bist hier" : n + " Geräte verbunden") : "verbinde…";
   for (let i = 0; i < 3; i++) {
     const b = seatBtns[i], s = seats[i], who = b.querySelector(".who");
     b.classList.toggle("mine", !!(s && s.me));
@@ -650,7 +650,7 @@ function updateUi(V, seats, names, peers, host) {
   startBtn.disabled = me.s < 0 || running;
   startBtn.hidden = running;
   closeBtn.hidden = true;
-  statusEl.textContent = me.s < 0 ? (running ? "Du schaust zu." : "Tipp auf einen Platz, um mitzuspielen.")
+  statusEl.textContent = !room ? "Online-Spiel nicht verfügbar. Bei claude.ai einloggen und den Link aus der direkten Einladung öffnen, nicht über einen öffentlichen Link." : me.s < 0 ? (running ? "Du schaust zu." : "Tipp auf einen Platz, um mitzuspielen.")
     : running ? "Du spielst " + COLN[me.s] + "." : "Bereit. Jeder am Tisch kann anpfeifen, freie Plätze übernimmt ein Bot.";
 }
 
