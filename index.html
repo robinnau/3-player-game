@@ -367,7 +367,7 @@ function keyBits() {
 const GAME_KEYS = ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Space", "KeyA", "KeyD", "KeyW"];
 addEventListener("keydown", e => {
   if (e.target && (e.target.tagName === "INPUT")) return;
-  if (GAME_KEYS.includes(e.code)) { keys.add(e.code); if (cardHiddenForPlay()) e.preventDefault(); }
+  if (GAME_KEYS.includes(e.code)) { keys.add(e.code); e.preventDefault(); if (document.activeElement && document.activeElement.tagName === "BUTTON") document.activeElement.blur(); }
   ensureAudio();
 });
 addEventListener("keyup", e => keys.delete(e.code));
@@ -601,8 +601,8 @@ const seatBtns = [0, 1, 2].map(i => {
   return b;
 });
 let cardOpen = true, lastPh = "lobby";
-$("#seatBtn").onclick = () => { cardOpen = !cardOpen; };
-closeBtn.onclick = () => { cardOpen = false; };
+$("#seatBtn").onclick = e => { cardOpen = !cardOpen; uiSig = ""; e.currentTarget.blur(); };
+closeBtn.onclick = () => { cardOpen = false; uiSig = ""; closeBtn.blur(); };
 let wakeLock = null;
 startBtn.onclick = () => {
   ensureAudio();
@@ -611,7 +611,7 @@ startBtn.onclick = () => {
   if (sim) { if (sim.ph === "lobby" || sim.ph === "over") startGame(sim); }
   else setP({ go: (me.go | 0) + 1 });
 };
-function cardHiddenForPlay() { return card.hidden; }
+const seatBtnEl = $("#seatBtn");
 let uiSig = "";
 function updateUi(V, seats, names, peers, host) {
   const ph = V ? V.ph : "lobby";
@@ -619,7 +619,9 @@ function updateUi(V, seats, names, peers, host) {
   if (running && (lastPh === "lobby" || lastPh === "over")) cardOpen = false;
   if (!running && (lastPh !== ph)) cardOpen = true;
   lastPh = ph;
-  card.hidden = !(cardOpen || !running);
+  card.hidden = !cardOpen;
+  seatBtnEl.textContent = cardOpen ? "Zum Feld" : "Plätze";
+  seatBtnEl.setAttribute("aria-expanded", String(cardOpen));
   const online = room && room.connected();
   const n = peers.filter(p => p.peer !== "~me" || p.me).length;
   const sig = JSON.stringify([ph, names, seats.map(s => s ? (s.me ? "me" : s.peer) : 0), me.s, online, n, V ? V.sc : 0, V ? V.win : -1, !!host, card.hidden]);
@@ -647,7 +649,7 @@ function updateUi(V, seats, names, peers, host) {
   startBtn.textContent = ph === "over" ? "Nochmal" : "Anpfiff";
   startBtn.disabled = me.s < 0 || running;
   startBtn.hidden = running;
-  closeBtn.hidden = !running;
+  closeBtn.hidden = true;
   statusEl.textContent = me.s < 0 ? (running ? "Du schaust zu." : "Tipp auf einen Platz, um mitzuspielen.")
     : running ? "Du spielst " + COLN[me.s] + "." : "Bereit. Jeder am Tisch kann anpfeifen, freie Plätze übernimmt ein Bot.";
 }
